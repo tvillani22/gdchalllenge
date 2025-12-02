@@ -1,102 +1,200 @@
-version: "3.6"
+x-build-platforms: &build-platforms [] # ["linux/arm64", "linux/amd64"]
 
-x-spark_build: &spark_build
-  context: .
-  dockerfile: spark.Dockerfile
+x-hadoop-environment: &hadoop-env
+  CLUSTER_NAME: HadoopCluster
+  
+x-spark-build: &spark-build
+  context: ./spark/
   args:
-    - HADOOP_VERSION=${HADOOP_VERSION}
+    - HADOOP_VERSION=${HADOOP_VERSION_MAJOR_MINOR}
     - SPARK_VERSION=${SPARK_VERSION}
+  platforms: *build-platforms
 
-x-spark_environment: &spark_env
+x-hadoop-build: &hadoop-build
+  context: ./hadoop
+  args:
+    - HADOOP_VERSION=${HADOOP_VERSION_MAJOR_MINOR}.${HADOOP_VERSION_PATCH}
+    - HADOOP_HOME=${HADOOP_HOME}
+    - HADOOP_CONF_DIR=${HADOOP_CONF_DIR}
+    - HADOOP_LOG_DIR=${HADOOP_LOG_DIR}
+    - HADOOP_HDFS_CONF_DFS_NAME_DIR=${HADOOP_HDFS_CONF_DFS_NAME_DIR}
+    - HADOOP_HDFS_CONF_DFS_DATA_DIR=${HADOOP_HDFS_CONF_DFS_DATA_DIR}
+    - SPARK_LOGS_HDFS_PATH=${SPARK_LOGS_HDFS_PATH}
+  platforms: *build-platforms
+
+x-spark-environment: &spark-env
   SPARK_MASTER_HOST: ${SPARK_MASTER_HOST}
   SPARK_MASTER_PORT: ${SPARK_MASTER_PORT}
   PYSPARK_PYTHON: ${PYSPARK_PYTHON}
-  SPARK_HOME: /usr/bin/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}
 
-x-spark_worker_environment: &spark_worker_env
-  <<: *spark_env
-  SPARK_WORKER_CORES: 1
-  SPARK_WORKER_MEMORY: 2g
+x-standard-healthcheck: &std-healthcheck
+  interval: 10s
+  retries: 10
+  timeout: 15s
 
 x-networks: &shared_net
   - cluster_network
 
+x-spark-worker-service: &spark-worker-service
+    build: *spark-build
+    command: >
+      bin/spark-class org.apache.spark.deploy.worker.Worker 
+      spark://${SPARK_MASTER_HOST}:${SPARK_MASTER_PORT} >> logs/spark-worker.out
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 2g
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+    image: tvillani/gd:spark-node
+    networks: *shared_net
+    volumes:
+      - shared_workspace:${WORKSPACE_PATH}
+
+
 services:
+
+  # BASE
+  base:
+    build:
+      context: ./base/
+      platforms: *build-platforms
+    image: tvillani/gd:ubuntu-20.04-openjdk-8-jre
+    profiles:
+      - aux
+
+  # HADOOP
+  namenode: &namenode
+    build: *hadoop-build
+    command: ["hdfs", "namenode"]
+    container_name: namenode
+    environment:
+      <<: *hadoop-env
+      FORCE_HDFS_FORMAT: ${FORCE_HDFS_FORMAT:-false} 
+    hostname: namenode
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:50070/"]
+    image: tvillani/gd:hadoop-node
+    networks: *shared_net
+    ports:
+        - 50070:50070
+        - 8020:8020
+    restart: on-failure:3
+    volumes:
+      - namenode_data:${HADOOP_HDFS_CONF_DFS_NAME_DIR}
+
+  datanode:
+    build: *hadoop-build
+    command: ["hdfs", "datanode"]
+    container_name: datanode
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment: *hadoop-env
+    hostname: datanode
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:50075/"]
+    image: tvillani/gd:hadoop-node
+    networks: *shared_net
+    ports:
+      - 50075:50075
+    volumes:
+      - datanode_data:${HADOOP_HDFS_CONF_DFS_DATA_DIR}
+
+  # SPARK
+  spark-master:
+    build: *spark-build
+    command: "bin/spark-class org.apache.spark.deploy.master.Master >> logs/spark-master.out"
+    container_name: spark-master
+    environment: *spark-env
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+    hostname: spark-master
+    image: tvillani/gd:spark-node
+    networks: *shared_net
+    ports:
+      - 8080:8080
+      - 7077:7077
+    volumes:
+      - shared_workspace:${WORKSPACE_PATH}
+
+  spark-worker-1:
+    <<: *spark-worker-service
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    ports:
+      - 8081:8081
+
+  spark-worker-2:
+    <<: *spark-worker-service
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    ports:
+      - 8082:8081
+
+  # CLIENT
   client:
-    image: tvillani/grandatachallenge:client
     build:
       context: .
-      dockerfile: client.Dockerfile
+      dockerfile: ./client/Dockerfile
       args:
         - WORKSPACE_PATH=${WORKSPACE_PATH}
         - SPARK_VERSION=${SPARK_VERSION}
         - PYTHON_VERSION=${PYTHON_VERSION}
+      platforms: *build-platforms
     container_name: client
+    env_file:
+      - .env
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8888/"]
+    hostname: client
+    image: tvillani/gd:client-node
     networks: *shared_net
     ports:
       - 8888:8888
       - 4040:4040
     volumes:
-      - shared_fs:${WORKSPACE_PATH}
+      - shared_workspace:${WORKSPACE_PATH}
 
-  spark-master:
-    image: tvillani/grandatachallenge:spark
-    build:
-      context: .
-      dockerfile: spark.Dockerfile
-      args:
-        - HADOOP_VERSION=${HADOOP_VERSION}
-        - SPARK_VERSION=${SPARK_VERSION}
-    container_name: spark-master
-    networks: *shared_net
-    command: "bin/spark-class org.apache.spark.deploy.master.Master >> logs/spark-master.out"
-    ports:
-      - 8080:8080
-      - 7077:7077
-      - 18080:18080
-    volumes:
-      - shared_fs:${WORKSPACE_PATH}
-    environment: *spark_env
-
-  spark-worker-1:
-    image: tvillani/grandatachallenge:spark
-    build: *spark_build
-    container_name: spark-worker-1
+  history-server:
+    build: *spark-build
+    command: /bin/bash -c "sleep 30 && ./sbin/start-history-server.sh && tail -f /dev/null"
+    hostname: history-server
+    image: tvillani/gd:spark-node
+    container_name: history-server
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment: *spark-env
+    healthcheck:
+      <<: *std-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:18080/"]
     networks: *shared_net
     ports:
-      - 8081:8081
-    volumes:
-      - shared_fs:${WORKSPACE_PATH}
-    environment: *spark_worker_env
-    command: >
-      bin/spark-class org.apache.spark.deploy.worker.Worker 
-      spark://${SPARK_MASTER_HOST}:${SPARK_MASTER_PORT} >> logs/spark-worker.out
+      - "18080:18080" 
+    restart: always
 
-  spark-worker-2:
-    image: tvillani/grandatachallenge:spark
-    build: *spark_build
-    container_name: spark-worker-2
-    networks: *shared_net
-    ports:
-      - 8082:8081
-    volumes:
-      - shared_fs:${WORKSPACE_PATH}
-    environment: *spark_worker_env
-    command: >
-      bin/spark-class org.apache.spark.deploy.worker.Worker 
-      spark://${SPARK_MASTER_HOST}:${SPARK_MASTER_PORT} >> logs/spark-worker.out
-    depends_on:
-      - spark-master
+
+networks:
+  cluster_network:
+
 
 volumes:
-  shared_fs:
+  shared_workspace:
     driver: local
     driver_opts:
        o: bind
        type: none
        device: '${PWD}/workspace'
-
-networks:
-  cluster_network:
+  namenode_data:
+  datanode_data:
